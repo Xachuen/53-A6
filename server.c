@@ -15,9 +15,147 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <semaphore.h>
 
 #define MAX_LINE_LENGTH 4096
 #define MAX_TRANSFER_BYTES 200
+
+enum OpenMode { MODE_NONE = 0, MODE_READ = 1, MODE_APPEND = 2 };
+
+struct FileLock {
+  int readers;
+  int writer;
+  int owner_fd;
+  sem_t mutex;
+  int refcount;
+  char name[512];
+};
+
+struct FileNode {
+  char name[512];
+  struct FileLock *lock;
+  struct FileNode *next;
+};
+
+struct FileNode *glob_table_head;
+sem_t glob_table_sem;
+
+int P(sem_t *s) {
+  while (sem_wait(s) == -1 && errno == EINTR) {
+  }
+  return 0;
+}
+int V(sem_t *s) { return sem_post(s); }
+
+struct FileLock *find_or_create_lock(const char *name) {
+  struct FileLock *lock = NULL;
+  struct FileNode *node = NULL;
+
+  if (P(&glob_table_sem) < 0)
+    return NULL;
+
+  for (node = glob_table_head; node; node = node->next) {
+    if (strcmp(node->lock->name, name) == 0) {
+      lock = node->lock;
+      lock->refcount++;
+      V(&glob_table_sem);
+      return lock;
+    }
+  }
+
+  node = (struct FileNode *)malloc(sizeof(struct FileNode));
+  if (!node) {
+    V(&glob_table_sem);
+    return NULL;
+  }
+
+  lock = (struct FileLock *)malloc(sizeof(struct FileLock));
+  if (!lock) {
+    free(node);
+    V(&glob_table_sem);
+    return NULL;
+  }
+
+  strncpy(lock->name, name, sizeof(lock->name) - 1);
+  lock->name[sizeof(lock->name) - 1] = '\0';
+  lock->readers = 0;
+  lock->writer = 0;
+  lock->owner_fd = -1;
+  lock->refcount = 1;
+  if (sem_init(&lock->mutex, 0, 1) != 0) {
+    free(lock);
+    free(node);
+    V(&glob_table_sem);
+    return NULL;
+  }
+
+  node->lock = lock;
+  node->next = glob_table_head;
+  glob_table_head = node;
+
+  V(&glob_table_sem);
+  return lock;
+}
+
+void release_lock(struct FileLock *lock) {
+  if (!lock)
+    return;
+
+  if (P(&glob_table_sem) < 0)
+    return;
+
+  lock->refcount--;
+
+  if (lock->refcount == 0 && lock->readers == 0 && lock->writer == 0) {
+    struct FileNode **link_to_slot = &glob_table_head;
+    while (*link_to_slot && (*link_to_slot)->lock != lock) {
+      link_to_slot = &(*link_to_slot)->next;
+    }
+    if (*link_to_slot) {
+      struct FileNode *node_to_free = *link_to_slot;
+      *link_to_slot = node_to_free->next;
+      V(&glob_table_sem);
+      sem_destroy(&lock->mutex);
+      free(lock);
+      free(node_to_free);
+      return;
+    }
+  }
+
+  V(&glob_table_sem);
+}
+
+int try_open_read(struct FileLock *lock) {
+  if (!lock) return -1;
+  if (P(&lock->mutex) < 0) return -1;
+  if (lock->writer) { V(&lock->mutex); return -1; }
+  lock->readers++;
+  V(&lock->mutex);
+  return 0;
+}
+
+
+int try_open_append(struct FileLock *lock, int client_fd) {
+  if (!lock) return -1;
+  if (P(&lock->mutex) < 0) return -1;
+  if (lock->writer || lock->readers > 0) { V(&lock->mutex); return -1; }
+  lock->writer = 1;
+  lock->owner_fd = client_fd;
+  V(&lock->mutex);
+  return 0;
+}
+
+void close_for(int mode, struct FileLock *lock) {
+  if (!lock) return;
+  if (P(&lock->mutex) < 0) return;
+  if (mode == MODE_READ) {
+    if (lock->readers > 0) lock->readers--;
+  } else if (mode == MODE_APPEND) {
+    lock->writer = 0;
+    lock->owner_fd = -1;
+  }
+  V(&lock->mutex);
+}
 
 ssize_t socket_read_line(int socket_fd, char *buffer, size_t max_bytes) {
   size_t used = 0;
