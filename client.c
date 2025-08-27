@@ -121,7 +121,6 @@ int main(int argc, char **argv) {
   char user_line[MAX_LINE_LENGTH];
   char server_line[MAX_LINE_LENGTH];
 
-
   for (;;) {
     print_prompt();
     if (!fgets(user_line, sizeof(user_line), stdin))
@@ -164,17 +163,26 @@ int main(int argc, char **argv) {
         return 1;
       }
 
-      while (want > 0) {
+      if (want > 0) {
+        size_t remaining = want;
         char chunk[MAX_TRANSFER_BYTES];
-        size_t take = want > sizeof(chunk) ? sizeof(chunk) : want;
-        ssize_t got = socket_read_exact(sock, chunk, take);
-        if (got <= 0) {
-          fprintf(stderr, "\nconnection lost\n");
-          close(sock);
-          return 1;
+        int last = -1;
+
+        while (remaining > 0) {
+          size_t take = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
+          ssize_t got = socket_read_exact(sock, chunk, take);
+          if (got <= 0) {
+            fprintf(stderr, "\nconnection lost\n");
+            close(sock);
+            return 1;
+          }
+          fwrite(chunk, 1, (size_t)got, stdout);
+          last = (unsigned char)chunk[got - 1];
+          remaining -= (size_t)got;
         }
-        fwrite(chunk, 1, (size_t)got, stdout);
-        want -= (size_t)got;
+
+        if (last != '\n')
+          fputc('\n', stdout);
       }
       fflush(stdout);
     } else {

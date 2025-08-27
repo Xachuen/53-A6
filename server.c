@@ -41,9 +41,12 @@ struct FileNode *glob_table_head;
 sem_t glob_table_sem;
 
 int P(sem_t *s) {
-  while (sem_wait(s) == -1 && errno == EINTR) {
+  for (;;) {
+    if (sem_wait(s) == 0)
+      return 0;
+    if (errno != EINTR)
+      return -1;
   }
-  return 0;
 }
 int V(sem_t *s) { return sem_post(s); }
 
@@ -419,11 +422,20 @@ void *client_worker_thread(void *arg) {
       char *payload = strtok(NULL, "");
       if (!payload)
         payload = "";
-      size_t plen = strlen(payload);
+
+      size_t plen = strcspn(payload, "\r\n");
+
       if (plen > MAX_TRANSFER_BYTES)
         plen = MAX_TRANSFER_BYTES;
-      if (plen > 0)
-        fwrite(payload, 1, plen, session.file_stream);
+      if (plen > 0) {
+        if (fwrite(payload, 1, plen, session.file_stream) != plen) {
+          if (send_error_line(client_socket, "Write failed") < 0) {
+            close_session_and_socket(client_socket, &session);
+            return NULL;
+          }
+          continue;
+        }
+      }
       fflush(session.file_stream);
 
     } else if (strcmp(cmd, "close") == 0) {
