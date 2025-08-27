@@ -7,7 +7,6 @@
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <semaphore.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,7 +121,6 @@ int main(int argc, char **argv) {
   char user_line[MAX_LINE_LENGTH];
   char server_line[MAX_LINE_LENGTH];
 
-  sem_init(&glob_table_sem, 0, 1);
 
   for (;;) {
     print_prompt();

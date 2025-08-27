@@ -7,6 +7,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,12 +16,11 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <semaphore.h>
 
 #define MAX_LINE_LENGTH 4096
 #define MAX_TRANSFER_BYTES 200
 
-enum OpenMode { MODE_NONE = 0, MODE_READ = 1, MODE_APPEND = 2 };
+enum OpenMode { MODE_NONE = 0, MODE_READ, MODE_APPEND };
 
 struct FileLock {
   int readers;
@@ -126,19 +126,28 @@ void release_lock(struct FileLock *lock) {
 }
 
 int try_open_read(struct FileLock *lock) {
-  if (!lock) return -1;
-  if (P(&lock->mutex) < 0) return -1;
-  if (lock->writer) { V(&lock->mutex); return -1; }
+  if (!lock)
+    return -1;
+  if (P(&lock->mutex) < 0)
+    return -1;
+  if (lock->writer) {
+    V(&lock->mutex);
+    return -1;
+  }
   lock->readers++;
   V(&lock->mutex);
   return 0;
 }
 
-
 int try_open_append(struct FileLock *lock, int client_fd) {
-  if (!lock) return -1;
-  if (P(&lock->mutex) < 0) return -1;
-  if (lock->writer || lock->readers > 0) { V(&lock->mutex); return -1; }
+  if (!lock)
+    return -1;
+  if (P(&lock->mutex) < 0)
+    return -1;
+  if (lock->writer || lock->readers > 0) {
+    V(&lock->mutex);
+    return -1;
+  }
   lock->writer = 1;
   lock->owner_fd = client_fd;
   V(&lock->mutex);
@@ -146,10 +155,13 @@ int try_open_append(struct FileLock *lock, int client_fd) {
 }
 
 void close_for(int mode, struct FileLock *lock) {
-  if (!lock) return;
-  if (P(&lock->mutex) < 0) return;
+  if (!lock)
+    return;
+  if (P(&lock->mutex) < 0)
+    return;
   if (mode == MODE_READ) {
-    if (lock->readers > 0) lock->readers--;
+    if (lock->readers > 0)
+      lock->readers--;
   } else if (mode == MODE_APPEND) {
     lock->writer = 0;
     lock->owner_fd = -1;
@@ -210,26 +222,24 @@ int send_error_line(int socket_fd, const char *message) {
   return (int)socket_write_all(socket_fd, line, (size_t)len);
 }
 
-enum OpenMode { MODE_NONE = 0, MODE_READ, MODE_APPEND };
-
 struct Session {
   FILE *file_stream;
   enum OpenMode open_mode;
   char filename[512];
+  struct FileLock *lock;
 };
 
-/* TODO: implement a global lock table (filename -> {mutex, cond, readers,
- * writer}) */
-bool another_client_is_using_this_file(const char *filename) {
-  (void)filename;
-  /* TODO: check the lock table and return true if exclusive access is held
-   * elsewhere */
-  return false;
-}
-
 void close_session_and_socket(int client_socket, struct Session *session) {
-  if (session->file_stream)
-    fclose(session->file_stream);
+  if (session && session->open_mode != MODE_NONE) {
+    if (session->file_stream)
+      fclose(session->file_stream);
+    close_for(session->open_mode, session->lock);
+    release_lock(session->lock);
+    session->file_stream = NULL;
+    session->open_mode = MODE_NONE;
+    session->filename[0] = '\0';
+    session->lock = NULL;
+  }
   close(client_socket);
 }
 
@@ -241,6 +251,7 @@ void *client_worker_thread(void *arg) {
   session.file_stream = NULL;
   session.open_mode = MODE_NONE;
   session.filename[0] = '\0';
+  session.lock = NULL;
 
   for (;;) {
     ssize_t got =
@@ -264,6 +275,7 @@ void *client_worker_thread(void *arg) {
     if (strcmp(cmd, "quit") == 0) {
       close_session_and_socket(client_socket, &session);
       return NULL;
+
     } else if (strcmp(cmd, "openRead") == 0) {
       char *fname = strtok(NULL, "\r\n");
       if (!fname || !*fname)
@@ -285,11 +297,31 @@ void *client_worker_thread(void *arg) {
         continue;
       }
 
-      FILE *fs = fopen(fname, "rb");
-      if (!fs)
+      struct FileLock *lk = find_or_create_lock(fname);
+      if (!lk)
         continue;
+
+      if (try_open_read(lk) < 0) {
+        if (send_error_line(client_socket,
+                            "The file is open by another client.") < 0) {
+          release_lock(lk);
+          close_session_and_socket(client_socket, &session);
+          return NULL;
+        }
+        release_lock(lk);
+        continue;
+      }
+
+      FILE *fs = fopen(fname, "rb");
+      if (!fs) {
+        close_for(MODE_READ, lk);
+        release_lock(lk);
+        continue;
+      }
+
       session.file_stream = fs;
       session.open_mode = MODE_READ;
+      session.lock = lk;
       strncpy(session.filename, fname, sizeof(session.filename) - 1);
       session.filename[sizeof(session.filename) - 1] = '\0';
 
@@ -314,21 +346,32 @@ void *client_worker_thread(void *arg) {
         continue;
       }
 
-      if (another_client_is_using_this_file(fname)) {
+      struct FileLock *lk = find_or_create_lock(fname);
+      if (!lk)
+        continue;
+
+      if (try_open_append(lk, client_socket) < 0) {
         if (send_error_line(client_socket,
                             "The file is open by another client.") < 0) {
+          release_lock(lk);
           close_session_and_socket(client_socket, &session);
           return NULL;
         }
+        release_lock(lk);
         continue;
       }
 
       FILE *fs = fopen(fname, "ab+");
-      if (!fs)
+      if (!fs) {
+        close_for(MODE_APPEND, lk);
+        release_lock(lk);
         continue;
+      }
       fseek(fs, 0, SEEK_END);
+
       session.file_stream = fs;
       session.open_mode = MODE_APPEND;
+      session.lock = lk;
       strncpy(session.filename, fname, sizeof(session.filename) - 1);
       session.filename[sizeof(session.filename) - 1] = '\0';
 
@@ -384,11 +427,21 @@ void *client_worker_thread(void *arg) {
       fflush(session.file_stream);
 
     } else if (strcmp(cmd, "close") == 0) {
+      if (session.open_mode == MODE_NONE) {
+        if (send_error_line(client_socket, "File not open") < 0) {
+          close_session_and_socket(client_socket, &session);
+          return NULL;
+        }
+        continue;
+      }
       if (session.file_stream)
         fclose(session.file_stream);
+      close_for(session.open_mode, session.lock);
+      release_lock(session.lock);
       session.file_stream = NULL;
       session.open_mode = MODE_NONE;
       session.filename[0] = '\0';
+      session.lock = NULL;
     }
   }
 }
@@ -412,6 +465,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
     return 1;
   }
+
+  sem_init(&glob_table_sem, 0, 1);
+  glob_table_head = NULL; // (globals are zeroed, but being explicit is fine)
 
   int listen_fd = -1;
   for (struct addrinfo *it = alist; it; it = it->ai_next) {
